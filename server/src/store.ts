@@ -1,12 +1,14 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { normalizeRule } from './engine';
+import { normalizeSamplingState } from './sampling';
 import type { HitException, JobState, MaskRule } from './types';
 
 /**
  * 兼容旧版本任务文件，规整为当前 JobState：
  * - 旧版 revertedKeys（逐条撤销 key 列表）迁移为 state=reverted 的逐条例外；
  * - 缺少的实体决定 / 例外 / 化名表字段补空数组；
+ * - 缺少抽样复核字段时按默认配置迁移（不启用、无结论）；
  * - 旧规则缺少上下文字段（beforePattern / afterPattern / beforeChars / afterChars）
  *   时按「无条件」迁移，缺少跨 cue / 化名字段同样补齐默认值。
  */
@@ -40,6 +42,7 @@ export function migrateJobState(
       ? parsed.entityDecisions
       : [],
     aliases: Array.isArray(parsed.aliases) ? parsed.aliases : [],
+    sampling: normalizeSamplingState(parsed.sampling),
     updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : '',
   };
 }

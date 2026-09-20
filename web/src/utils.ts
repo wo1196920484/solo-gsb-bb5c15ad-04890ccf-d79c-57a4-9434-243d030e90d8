@@ -1,4 +1,4 @@
-import type { EntityDecision, Hit, HitException, MaskRule } from './types';
+import type { EntityDecision, Hit, HitException, MaskRule, SampleReview, SamplingState } from './types';
 
 export function uid(prefix = 'rule'): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -103,4 +103,21 @@ export function withExceptionTarget(
     else map.set(key, target);
   }
   return Array.from(map, ([key, state]) => ({ key, state }));
+}
+
+/* ---------------- 抽样复核 ---------------- */
+
+/** 默认抽样复核状态（旧任务缺少抽样字段时使用：不启用、无结论） */
+export const DEFAULT_SAMPLING_STATE: SamplingState = {
+  config: { enabled: false, total: 10, minPerRule: 1 },
+  reviews: [],
+};
+
+/** 结构比较复核结论（顺序敏感，与服务端计划输出一致），避免防抖循环 */
+export function sameReviews(a: SampleReview[], b: SampleReview[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((x, i) => {
+    const y = b[i];
+    return x.key === y.key && x.state === y.state && x.reviewedAt === y.reviewedAt;
+  });
 }

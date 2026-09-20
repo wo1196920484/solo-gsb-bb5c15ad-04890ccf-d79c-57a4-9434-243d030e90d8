@@ -51,6 +51,15 @@ export function ExportModal({ vtt, audit, onClose }: Props) {
             ? `（${audit.safetyScan.counts.kept} 处人工保留命中，仅提示并已记入审计）`
             : '（候选文本无残留命中）'}
         </div>
+        {audit.sampling.enabled && (
+          <div className="export-sampling">
+            ✓ 抽样复核：{audit.sampling.counts.samples} 条样本全部通过
+            （总抽样数 {audit.sampling.config.total}、每规则最低 {audit.sampling.config.minPerRule}）
+            {audit.sampling.counts.rejected > 0 &&
+              `，另有 ${audit.sampling.counts.rejected} 条驳回（已保留原文）`}
+            ——配置与结论已记入审计 <code>sampling</code>
+          </div>
+        )}
         <div className="modal-actions">
           <button
             className="btn"

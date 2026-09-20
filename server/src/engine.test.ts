@@ -13,8 +13,9 @@ import {
   timeToMs,
 } from './engine';
 import { PRESETS, SAMPLE_VTT } from './presets';
+import { allocateQuotas, SamplingPendingError } from './sampling';
 import { migrateJobState } from './store';
-import type { AliasEntry, EntityDecision, MaskRule } from './types';
+import type { AliasEntry, EntityDecision, MaskRule, SamplingState } from './types';
 
 let passed = 0;
 function test(name: string, fn: () => void): void {
@@ -446,7 +447,7 @@ test('实体决策：审计记录决策来源，导出与预览状态一致', ()
   const recs = ex.audit.records.filter((r) => r.entityKey === '张伟');
   assert.ok(recs.some((r) => r.status === 'applied' && r.decisionSource === 'exception'));
   assert.ok(recs.some((r) => r.status === 'reverted' && r.decisionSource === 'entity'));
-  assert.strictEqual(ex.audit.version, 6);
+  assert.strictEqual(ex.audit.version, 7);
   assert.strictEqual(ex.audit.stats.exceptionHits, 1);
   assert.ok(ex.audit.entityDecisions!.some((d) => d.entityKey === '张伟' && d.action === 'keep'));
   // 导出 VTT 与预览最终状态一致：例外处替换，其余保留
@@ -1249,7 +1250,7 @@ test('上下文条件：过滤计数写入导出审计；残留防线同样按�
   // 通过条件的号码正常脱敏，残留防线不再报该规则的二次命中（条件不满足）
   assert.strictEqual(v.safety.kept, 0, '被上下文过滤的候选不进入残留清单');
   const ex = exportResult({ vtt: CTX_VTT, rules: [rule] });
-  assert.strictEqual(ex.audit.version, 6);
+  assert.strictEqual(ex.audit.version, 7);
   assert.deepStrictEqual(ex.audit.contextFilters, [
     { ruleId: 'r-ctx', ruleName: '手机号-上下文', beforeFiltered: 1, afterFiltered: 0 },
   ]);
@@ -1261,6 +1262,270 @@ test('上下文条件：过滤计数写入导出审计；残留防线同样按�
   const v2 = buildPreview({ vtt: CTX_VTT, rules: [rule], revertedKeys: [key] });
   assert.strictEqual(v2.safety.kept, 1);
   assert.strictEqual(v2.safety.issues[0].match, '13812345678');
+});
+
+/* ---------------------------- 抽样复核 ---------------------------- */
+
+/** 两条规则各 4 个命中的样例字幕（姓名 × 4、手机号 × 4） */
+const SAMPLING_VTT = `WEBVTT
+
+00:00:00.000 --> 00:00:02.000
+客服张伟先生，电话 13812345678。
+
+00:00:02.500 --> 00:00:04.000
+李娜女士回电 13987654321。
+
+00:00:04.500 --> 00:00:06.000
+王芳女士手机 13711112222。
+
+00:00:06.500 --> 00:00:08.000
+赵敏女士手机 13633334444。
+`;
+
+test('抽样复核：确定性分层抽样，先满足各规则最低数且重复预览稳定', () => {
+  const rules = [presetRule('姓名'), presetRule('手机号')];
+  const sampling: SamplingState = {
+    config: { enabled: true, total: 4, minPerRule: 2 },
+    reviews: [],
+  };
+  const v1 = buildPreview({ vtt: SAMPLING_VTT, rules, sampling });
+  assert.strictEqual(v1.sampling.candidates, 8, '候选 = 最终应用命中');
+  assert.strictEqual(v1.sampling.samples.length, 4);
+  const countByRule = new Map<string, number>();
+  for (const s of v1.sampling.samples) {
+    countByRule.set(s.ruleId, (countByRule.get(s.ruleId) ?? 0) + 1);
+  }
+  assert.strictEqual(countByRule.get('r-姓名'), 2, '每规则先满足最低 2 条');
+  assert.strictEqual(countByRule.get('r-手机号'), 2);
+  assert.deepStrictEqual(
+    v1.sampling.quotas.map((q) => [q.ruleId, q.candidates, q.quota]),
+    [
+      ['r-姓名', 4, 2],
+      ['r-手机号', 4, 2],
+    ],
+  );
+  assert.strictEqual(v1.sampling.pending, 4);
+  assert.strictEqual(v1.sampling.blocked, true, '存在未复核样本时阻断导出');
+  // 同一候选集重复预览：样本键序列完全一致
+  const v2 = buildPreview({ vtt: SAMPLING_VTT, rules, sampling });
+  assert.deepStrictEqual(
+    v1.sampling.samples.map((s) => s.key),
+    v2.sampling.samples.map((s) => s.key),
+  );
+  // 未启用时不抽样、不阻断，但仍给出候选数
+  const off = buildPreview({ vtt: SAMPLING_VTT, rules });
+  assert.strictEqual(off.sampling.enabled, false);
+  assert.strictEqual(off.sampling.samples.length, 0);
+  assert.strictEqual(off.sampling.blocked, false);
+  assert.strictEqual(off.sampling.candidates, 8);
+});
+
+test('抽样复核：剩余名额按剩余命中占比以最大余数法分配', () => {
+  // 10 / 5 / 2 候选，总数 8、每规则最低 1：最低数占 3，余 5 按 9:4:1 分配
+  // 占比取整 3/1/0，余数最大者为 b → 4 / 3 / 1
+  const q = allocateQuotas(
+    [
+      { ruleId: 'a', count: 10 },
+      { ruleId: 'b', count: 5 },
+      { ruleId: 'c', count: 2 },
+    ],
+    8,
+    1,
+  );
+  assert.deepStrictEqual(
+    ['a', 'b', 'c'].map((id) => q.get(id)),
+    [4, 3, 1],
+  );
+  // 最低数之和超过总数：最低数优先（总数退化为下限）
+  const q2 = allocateQuotas(
+    [
+      { ruleId: 'a', count: 5 },
+      { ruleId: 'b', count: 5 },
+    ],
+    2,
+    2,
+  );
+  assert.strictEqual(q2.get('a'), 2);
+  assert.strictEqual(q2.get('b'), 2);
+  // 总数超过候选总数：按候选数截断
+  const q3 = allocateQuotas([{ ruleId: 'a', count: 3 }], 10, 0);
+  assert.strictEqual(q3.get('a'), 3);
+  // 候选不足最低数：按实际候选数，剩余名额照常分配
+  const q4 = allocateQuotas(
+    [
+      { ruleId: 'a', count: 1 },
+      { ruleId: 'b', count: 6 },
+    ],
+    4,
+    2,
+  );
+  assert.strictEqual(q4.get('a'), 1);
+  assert.strictEqual(q4.get('b'), 3);
+});
+
+test('抽样复核：已通过项钉入样本，驳回写入例外后补抽新样本', () => {
+  const rules = [presetRule('手机号')];
+  const config = { enabled: true, total: 2, minPerRule: 1 };
+  const v1 = buildPreview({ vtt: SAMPLING_VTT, rules, sampling: { config, reviews: [] } });
+  assert.strictEqual(v1.sampling.samples.length, 2);
+  const [s1, s2] = v1.sampling.samples;
+
+  // 通过 s1：钉入样本；命中集不变时样本集合保持稳定
+  const reviews = [
+    { key: s1.key, state: 'approved' as const, reviewedAt: '2026-09-20T00:00:00.000Z' },
+  ];
+  const v2 = buildPreview({ vtt: SAMPLING_VTT, rules, sampling: { config, reviews } });
+  assert.deepStrictEqual(
+    v2.sampling.samples.map((s) => s.key),
+    v1.sampling.samples.map((s) => s.key),
+    '命中集不变时样本保持稳定',
+  );
+  assert.strictEqual(v2.sampling.samples.find((s) => s.key === s1.key)?.state, 'approved');
+  assert.strictEqual(v2.sampling.approved, 1);
+  assert.strictEqual(v2.sampling.pending, 1);
+
+  // 驳回 s2（同步写入逐条例外）：s2 退出候选集，补抽一条新样本
+  const rejectedReviews = [
+    ...reviews,
+    { key: s2.key, state: 'rejected' as const, reviewedAt: '2026-09-20T00:01:00.000Z' },
+  ];
+  const v3 = buildPreview({
+    vtt: SAMPLING_VTT,
+    rules,
+    hitExceptions: [{ key: s2.key, state: 'reverted' }],
+    sampling: { config, reviews: rejectedReviews },
+  });
+  assert.strictEqual(v3.sampling.candidates, 3, '驳回的命中保留原文、退出候选集');
+  assert.strictEqual(v3.sampling.samples.length, 2, '补抽后样本数不变');
+  assert.ok(!v3.sampling.samples.some((s) => s.key === s2.key), '驳回命中不再出现在样本中');
+  assert.ok(
+    v3.sampling.samples.some((s) => s.key === s1.key && s.state === 'approved'),
+    '已通过项保留在样本中',
+  );
+  assert.strictEqual(v3.sampling.rejected, 1);
+  assert.strictEqual(v3.sampling.pending, 1, '补抽的新样本待复核');
+  assert.strictEqual(v3.sampling.blocked, true);
+
+  // 复核全部完成后导出：审计同时记录通过与驳回结论，驳回处保留原文
+  const finalReviews = [
+    ...v3.sampling.reviews,
+    ...v3.sampling.samples
+      .filter((s) => s.state === 'pending')
+      .map((s) => ({ key: s.key, state: 'approved' as const, reviewedAt: '2026-09-20T00:02:00.000Z' })),
+  ];
+  const ex = exportResult({
+    vtt: SAMPLING_VTT,
+    rules,
+    hitExceptions: [{ key: s2.key, state: 'reverted' }],
+    sampling: { config, reviews: finalReviews },
+  });
+  assert.strictEqual(ex.audit.sampling.counts.rejected, 1);
+  assert.strictEqual(ex.audit.sampling.counts.approved, 2);
+  assert.ok(
+    ex.audit.sampling.conclusions.some((c) => c.state === 'rejected' && c.key === s2.key),
+  );
+  assert.ok(ex.vtt.includes(s2.match), '驳回的命中保留原文');
+  assert.ok(
+    ex.audit.records.some((r) => r.key === s2.key && r.status === 'reverted'),
+    '驳回写入的逐条例外进入审计记录',
+  );
+});
+
+test('抽样复核：未复核阻断导出，全部通过后放行并写入审计', () => {
+  const rules = [presetRule('手机号')];
+  const config = { enabled: true, total: 2, minPerRule: 1 };
+  const v1 = buildPreview({ vtt: SAMPLING_VTT, rules, sampling: { config, reviews: [] } });
+  assert.strictEqual(v1.sampling.pending, 2);
+  // 存在未复核样本：导出被阻断
+  assert.throws(
+    () => exportResult({ vtt: SAMPLING_VTT, rules, sampling: { config, reviews: [] } }),
+    (e: unknown) => {
+      assert.ok(e instanceof SamplingPendingError);
+      assert.strictEqual(e.plan.pending, 2);
+      return true;
+    },
+  );
+  // 全部通过：放行，审计记录抽样配置、名额分配与结论
+  const reviews = v1.sampling.samples.map((s, i) => ({
+    key: s.key,
+    state: 'approved' as const,
+    reviewedAt: `2026-09-20T00:00:0${i}.000Z`,
+  }));
+  const ex = exportResult({ vtt: SAMPLING_VTT, rules, sampling: { config, reviews } });
+  assert.strictEqual(ex.audit.version, 7);
+  assert.strictEqual(ex.audit.sampling.enabled, true);
+  assert.deepStrictEqual(ex.audit.sampling.config, config);
+  assert.strictEqual(ex.audit.sampling.candidates, 4);
+  assert.deepStrictEqual(ex.audit.sampling.counts, {
+    samples: 2,
+    approved: 2,
+    rejected: 0,
+    pending: 0,
+  });
+  assert.strictEqual(ex.audit.sampling.conclusions.length, 2);
+  assert.ok(
+    ex.audit.sampling.conclusions.every(
+      (c) => c.state === 'approved' && c.ruleName === '手机号' && c.match.length === 11,
+    ),
+  );
+  assert.ok(ex.audit.sampling.quotas.some((q) => q.ruleId === 'r-手机号' && q.quota === 2));
+});
+
+test('抽样复核：失效结论（命中消失 / 状态不一致）不计入计划', () => {
+  const rules = [presetRule('手机号')];
+  const config = { enabled: true, total: 2, minPerRule: 1 };
+  const v1 = buildPreview({ vtt: SAMPLING_VTT, rules, sampling: { config, reviews: [] } });
+  const [s1, s2] = v1.sampling.samples;
+  const stale = [
+    { key: s1.key, state: 'approved' as const, reviewedAt: 't' },
+    // s2 仍是应用态：驳回结论与当前状态不一致，失效
+    { key: s2.key, state: 'rejected' as const, reviewedAt: 't' },
+    // 命中已不存在：失效
+    { key: 'ghost-key', state: 'approved' as const, reviewedAt: 't' },
+  ];
+  const v2 = buildPreview({ vtt: SAMPLING_VTT, rules, sampling: { config, reviews: stale } });
+  assert.deepStrictEqual(
+    v2.sampling.reviews.map((r) => r.key),
+    [s1.key],
+    '仅仍有效的结论保留在计划中',
+  );
+  assert.strictEqual(v2.sampling.rejected, 0);
+  assert.strictEqual(v2.sampling.approved, 1);
+  assert.strictEqual(v2.sampling.pending, 1);
+  assert.ok(
+    v2.sampling.samples.every((s) => s.key === s1.key || s.state === 'pending'),
+    '失效的驳回结论不影响补抽',
+  );
+});
+
+test('抽样复核：旧任务缺少抽样字段时按默认配置迁移', () => {
+  const m = migrateJobState({ jobId: 'j1', vtt: 'WEBVTT', rules: [] });
+  assert.strictEqual(m.sampling.config.enabled, false);
+  assert.strictEqual(m.sampling.config.total, 10);
+  assert.strictEqual(m.sampling.config.minPerRule, 1);
+  assert.deepStrictEqual(m.sampling.reviews, []);
+
+  // 已有配置与结论保留；非法值规整、非法结论条目剔除
+  const m2 = migrateJobState(
+    JSON.parse(
+      JSON.stringify({
+        sampling: {
+          config: { enabled: true, total: 5.6, minPerRule: -2 },
+          reviews: [
+            { key: 'k1', state: 'approved', reviewedAt: 't' },
+            { key: 'k2', state: 'nope' },
+            'bad',
+          ],
+        },
+      }),
+    ),
+  );
+  assert.strictEqual(m2.sampling.config.enabled, true);
+  assert.strictEqual(m2.sampling.config.total, 6, '总数取整');
+  assert.strictEqual(m2.sampling.config.minPerRule, 1, '非法最低数回退默认');
+  assert.deepStrictEqual(m2.sampling.reviews, [
+    { key: 'k1', state: 'approved', reviewedAt: 't' },
+  ]);
 });
 
 console.log(`\n引擎自测全部通过（${passed} 项）`);

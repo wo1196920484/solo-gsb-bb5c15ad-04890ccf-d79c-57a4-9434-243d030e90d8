@@ -7,6 +7,7 @@ import {
   normalizeRule,
   SafetyScanBlockedError,
 } from './engine';
+import { normalizeSamplingState, SamplingPendingError } from './sampling';
 import { PRESETS } from './presets';
 import { JobStore } from './store';
 import type {
@@ -16,6 +17,7 @@ import type {
   JobState,
   MaskRule,
   PreviewInput,
+  SamplingState,
 } from './types';
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -190,8 +192,41 @@ function legacyRevertedAsExceptions(
   return [...existing, ...extra];
 }
 
+/** 校验并净化抽样复核状态；非法时返回错误文案（缺省 = 不启用的默认配置） */
+function validateSampling(sampling: unknown): SamplingState | string {
+  if (sampling === undefined || sampling === null) return normalizeSamplingState(undefined);
+  if (typeof sampling !== 'object') return 'sampling 必须是对象';
+  const s = sampling as Record<string, unknown>;
+  if (s.config !== undefined && (s.config === null || typeof s.config !== 'object'))
+    return 'sampling.config 必须是对象';
+  if (s.config !== undefined) {
+    const c = s.config as Record<string, unknown>;
+    if (c.enabled !== undefined && typeof c.enabled !== 'boolean')
+      return 'sampling.config.enabled 必须是布尔值';
+    for (const f of ['total', 'minPerRule'] as const) {
+      if (
+        c[f] !== undefined &&
+        (typeof c[f] !== 'number' || !Number.isFinite(c[f]) || c[f] < 0)
+      )
+        return `sampling.config.${f} 必须是非负数字`;
+    }
+  }
+  if (s.reviews !== undefined && !Array.isArray(s.reviews))
+    return 'sampling.reviews 必须是数组';
+  if (Array.isArray(s.reviews)) {
+    for (const r of s.reviews) {
+      if (r === null || typeof r !== 'object') return '存在非法复核结论';
+      const x = r as Record<string, unknown>;
+      if (typeof x.key !== 'string' || !x.key) return '复核结论缺少 key';
+      if (x.state !== 'approved' && x.state !== 'rejected')
+        return `复核结论 ${x.key} 状态非法`;
+    }
+  }
+  return normalizeSamplingState(sampling);
+}
+
 function readPreviewBody(req: Request): PreviewInput {
-  const { vtt, rules, revertedKeys, hitExceptions, entityDecisions, aliases } =
+  const { vtt, rules, revertedKeys, hitExceptions, entityDecisions, aliases, sampling } =
     req.body as Partial<PreviewInput>;
   if (typeof vtt !== 'string') {
     throw new Error('vtt 必须是字符串');
@@ -204,6 +239,8 @@ function readPreviewBody(req: Request): PreviewInput {
   if (typeof checkedExceptions === 'string') throw new Error(checkedExceptions);
   const checkedDecisions = validateDecisions(entityDecisions);
   if (typeof checkedDecisions === 'string') throw new Error(checkedDecisions);
+  const checkedSampling = validateSampling(sampling);
+  if (typeof checkedSampling === 'string') throw new Error(checkedSampling);
   return {
     vtt,
     rules: checked,
@@ -213,6 +250,7 @@ function readPreviewBody(req: Request): PreviewInput {
     hitExceptions: checkedExceptions,
     entityDecisions: checkedDecisions,
     aliases: checkedAliases,
+    sampling: checkedSampling,
   };
 }
 
@@ -233,7 +271,7 @@ app.get('/api/job', (_req, res) => {
 
 /** 自动保存编辑中的任务 */
 app.put('/api/job', (req, res) => {
-  const { vtt, rules, revertedKeys, hitExceptions, entityDecisions, aliases } =
+  const { vtt, rules, revertedKeys, hitExceptions, entityDecisions, aliases, sampling } =
     req.body as Partial<JobState> & { revertedKeys?: unknown };
   if (typeof vtt !== 'string') return res.status(400).json({ error: 'vtt 必须是字符串' });
   const checked = validateRules(rules);
@@ -252,6 +290,9 @@ app.put('/api/job', (req, res) => {
   const checkedAliases = validateAliases(aliases);
   if (typeof checkedAliases === 'string')
     return res.status(400).json({ error: checkedAliases });
+  const checkedSampling = validateSampling(sampling);
+  if (typeof checkedSampling === 'string')
+    return res.status(400).json({ error: checkedSampling });
 
   const previous = store.get();
   const state: JobState = {
@@ -261,6 +302,7 @@ app.put('/api/job', (req, res) => {
     hitExceptions: exceptions,
     entityDecisions: checkedDecisions,
     aliases: checkedAliases,
+    sampling: checkedSampling,
     updatedAt: new Date().toISOString(),
   };
   store.save(state);
@@ -277,7 +319,7 @@ app.post('/api/preview', (req, res) => {
   }
 });
 
-/** 确认导出：新 VTT + JSON 审计报告（残留防线阻断时返回 409 与问题清单） */
+/** 确认导出：新 VTT + JSON 审计报告（残留防线 / 抽样复核未完成时返回 409 与问题清单） */
 app.post('/api/export', (req, res) => {
   try {
     const input = readPreviewBody(req);
@@ -289,6 +331,10 @@ app.post('/api/export', (req, res) => {
   } catch (e) {
     if (e instanceof SafetyScanBlockedError) {
       res.status(409).json({ error: e.message, safetyScan: e.scan });
+      return;
+    }
+    if (e instanceof SamplingPendingError) {
+      res.status(409).json({ error: e.message, sampling: e.plan });
       return;
     }
     res.status(400).json({ error: (e as Error).message });

@@ -185,6 +185,77 @@ export interface ContextFilterStat {
   afterFiltered: number;
 }
 
+/* ---------------- 抽样复核 ---------------- */
+
+/** 抽样复核配置（随任务持久化） */
+export interface SamplingConfig {
+  /** 启用后：从最终应用命中中抽样逐项复核，存在未复核样本时阻断导出 */
+  enabled: boolean;
+  /** 总抽样数（超过候选总数时按候选数截断） */
+  total: number;
+  /** 每条启用规则的最低样本数（候选不足时按实际候选数） */
+  minPerRule: number;
+}
+
+/** 抽样复核结论（按稳定命中键持久化） */
+export interface SampleReview {
+  key: string;
+  /** approved 通过（保持替换）；rejected 驳回（同步写入逐条例外、保留原文） */
+  state: 'approved' | 'rejected';
+  reviewedAt: string;
+}
+
+/** 抽样复核状态：配置 + 复核结论（随任务持久化） */
+export interface SamplingState {
+  config: SamplingConfig;
+  reviews: SampleReview[];
+}
+
+/** 抽样样本（面板逐项复核） */
+export interface SampleItem {
+  key: string;
+  ruleId: string;
+  ruleName: string;
+  /** 锚定 cue（首个涉及 cue）序号 */
+  cueIndex: number;
+  /** 在锚定 cue 纯文本中的起始偏移 */
+  start: number;
+  match: string;
+  replacement: string;
+  entityKey: string;
+  /** pending 待复核 / approved 已通过 */
+  state: 'pending' | 'approved';
+  reviewedAt?: string;
+}
+
+/** 单条规则的名额分配（先最低数、再最大余数法） */
+export interface SamplingQuota {
+  ruleId: string;
+  ruleName: string;
+  /** 该规则最终应用命中数（候选数） */
+  candidates: number;
+  /** 分配到的样本名额 */
+  quota: number;
+}
+
+/** 抽样复核计划：确定性分层抽样结果 + 复核进度 */
+export interface SamplingPlan {
+  enabled: boolean;
+  config: SamplingConfig;
+  /** 候选总数（最终应用命中数） */
+  candidates: number;
+  quotas: SamplingQuota[];
+  samples: SampleItem[];
+  pending: number;
+  approved: number;
+  /** 当前仍有效的驳回结论数（对应命中保留原文） */
+  rejected: number;
+  /** 仍有效的复核结论（失效结论已剔除） */
+  reviews: SampleReview[];
+  /** 存在未复核样本（阻断导出） */
+  blocked: boolean;
+}
+
 export interface PreviewResult {
   cueCount: number;
   totalHits: number;
@@ -202,6 +273,8 @@ export interface PreviewResult {
   safety: SafetyScanSummary;
   /** 上下文条件过滤计数（仅列实际发生过滤的规则，按规则顺序） */
   contextFilters: ContextFilterStat[];
+  /** 抽样复核：从最终应用命中确定性分层抽样的结果与复核进度 */
+  sampling: SamplingPlan;
 }
 
 export interface JobState {
@@ -213,6 +286,8 @@ export interface JobState {
   /** 实体级决定 */
   entityDecisions: EntityDecision[];
   aliases: AliasEntry[];
+  /** 抽样复核配置与复核结论 */
+  sampling: SamplingState;
   updatedAt: string;
 }
 
@@ -258,6 +333,23 @@ export interface AuditReport {
     blocked: boolean;
     counts: { kept: number; artifact: number; crossBoundary: number };
     issues: SafetyScanIssue[];
+  };
+  /** 抽样复核：导出时的抽样配置、名额分配与复核结论 */
+  sampling: {
+    enabled: boolean;
+    config: SamplingConfig;
+    candidates: number;
+    quotas: SamplingQuota[];
+    counts: { samples: number; approved: number; rejected: number; pending: number };
+    conclusions: {
+      key: string;
+      state: 'approved' | 'rejected';
+      reviewedAt: string;
+      ruleId: string;
+      ruleName: string;
+      cueIndex: number;
+      match: string;
+    }[];
   };
 }
 

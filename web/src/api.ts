@@ -8,6 +8,7 @@ import type {
   MaskRule,
   Preset,
   PreviewResult,
+  SamplingState,
 } from './types';
 
 /** 预览 / 保存 / 导出共用的任务载荷（三者必须使用同一份状态） */
@@ -17,6 +18,7 @@ export interface JobPayload {
   hitExceptions: HitException[];
   entityDecisions: EntityDecision[];
   aliases: AliasEntry[];
+  sampling: SamplingState;
 }
 
 async function req<T>(url: string, init?: RequestInit): Promise<T> {

@@ -256,6 +256,88 @@ export interface ContextFilterStat {
   afterFiltered: number;
 }
 
+/* ------------------------------------------------------------------ */
+/* 抽样复核                                                             */
+/* ------------------------------------------------------------------ */
+
+/** 抽样复核配置（随任务持久化） */
+export interface SamplingConfig {
+  /** 启用后：从最终应用命中中抽样逐项复核，存在未复核样本时阻断导出 */
+  enabled: boolean;
+  /** 总抽样数（超过候选总数时按候选数截断） */
+  total: number;
+  /** 每条启用规则的最低样本数（候选不足时按实际候选数） */
+  minPerRule: number;
+}
+
+/** 抽样复核结论（按稳定命中键持久化） */
+export interface SampleReview {
+  /** 命中键（与预览 / 例外一致的稳定命中键） */
+  key: string;
+  /**
+   * approved 通过（保持替换）；rejected 驳回（同步写入逐条例外、保留原文，
+   * 命中随之退出候选集，服务端补抽新样本）
+   */
+  state: 'approved' | 'rejected';
+  /** 复核时间（ISO 字符串，展示 / 审计辅助） */
+  reviewedAt: string;
+}
+
+/** 抽样复核状态：配置 + 复核结论（随任务持久化） */
+export interface SamplingState {
+  config: SamplingConfig;
+  reviews: SampleReview[];
+}
+
+/** 抽样样本（面板逐项复核；驳回的命中退出候选集，不再出现在样本中） */
+export interface SampleItem {
+  /** 稳定命中键 */
+  key: string;
+  ruleId: string;
+  ruleName: string;
+  /** 锚定 cue（首个涉及 cue）序号 */
+  cueIndex: number;
+  /** 在锚定 cue 纯文本中的起始偏移 */
+  start: number;
+  match: string;
+  replacement: string;
+  /** 实体键：NFKC + trim 后的原文 */
+  entityKey: string;
+  /** pending 待复核 / approved 已通过 */
+  state: 'pending' | 'approved';
+  /** 通过时间（approved 时存在） */
+  reviewedAt?: string;
+}
+
+/** 单条规则的名额分配（先最低数、再最大余数法；审计透明） */
+export interface SamplingQuota {
+  ruleId: string;
+  ruleName: string;
+  /** 该规则最终应用命中数（候选数） */
+  candidates: number;
+  /** 分配到的样本名额 */
+  quota: number;
+}
+
+/** 抽样复核计划：确定性分层抽样结果 + 复核进度 */
+export interface SamplingPlan {
+  enabled: boolean;
+  config: SamplingConfig;
+  /** 候选总数（最终应用命中数） */
+  candidates: number;
+  /** 各规则名额分配（仅有候选的规则） */
+  quotas: SamplingQuota[];
+  samples: SampleItem[];
+  pending: number;
+  approved: number;
+  /** 当前仍有效的驳回结论数（对应命中保留原文） */
+  rejected: number;
+  /** 仍有效的复核结论（失效结论已剔除：命中消失或状态不一致） */
+  reviews: SampleReview[];
+  /** 存在未复核样本（阻断导出） */
+  blocked: boolean;
+}
+
 export interface PreviewResult {
   cueCount: number;
   totalHits: number;
@@ -274,6 +356,8 @@ export interface PreviewResult {
   safety: SafetyScanSummary;
   /** 上下文条件过滤计数（仅列实际发生过滤的规则，按规则顺序） */
   contextFilters: ContextFilterStat[];
+  /** 抽样复核：从最终应用命中确定性分层抽样的结果与复核进度 */
+  sampling: SamplingPlan;
 }
 
 export interface PreviewInput {
@@ -286,6 +370,8 @@ export interface PreviewInput {
   /** 实体级决定（持久化，新命中自动继承） */
   entityDecisions?: EntityDecision[];
   aliases?: AliasEntry[];
+  /** 抽样复核配置与结论 */
+  sampling?: SamplingState;
 }
 
 export interface AuditRecord {
@@ -344,6 +430,26 @@ export interface AuditReport {
     counts: { kept: number; artifact: number; crossBoundary: number };
     issues: SafetyScanIssue[];
   };
+  /** 抽样复核：导出时的抽样配置、名额分配与复核结论（存在未复核样本时导出被阻断） */
+  sampling: {
+    enabled: boolean;
+    config: SamplingConfig;
+    /** 候选总数（最终应用命中数） */
+    candidates: number;
+    /** 各规则名额分配 */
+    quotas: SamplingQuota[];
+    counts: { samples: number; approved: number; rejected: number; pending: number };
+    /** 复核结论（导出时仍有效；驳回的命中已保留原文） */
+    conclusions: {
+      key: string;
+      state: 'approved' | 'rejected';
+      reviewedAt: string;
+      ruleId: string;
+      ruleName: string;
+      cueIndex: number;
+      match: string;
+    }[];
+  };
 }
 
 export interface JobState {
@@ -356,6 +462,8 @@ export interface JobState {
   entityDecisions: EntityDecision[];
   /** 稳定化名映射（持久化，编号不复用） */
   aliases: AliasEntry[];
+  /** 抽样复核配置与复核结论 */
+  sampling: SamplingState;
   updatedAt: string;
 }
 

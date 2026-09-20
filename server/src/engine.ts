@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import { parseVtt, serializeVtt } from './vtt';
+import { planSampling, SamplingPendingError } from './sampling';
 import type {
   AliasEntry,
   AuditRecord,
@@ -18,6 +19,7 @@ import type {
   SafetyScanKind,
   SafetyScanSegment,
   SafetyScanSummary,
+  SamplingState,
   SuppressedHit,
 } from './types';
 
@@ -464,6 +466,7 @@ export function buildPreview(input: {
   hitExceptions?: HitException[];
   entityDecisions?: EntityDecision[];
   aliases?: AliasEntry[];
+  sampling?: SamplingState;
 }): PreviewResult {
   const parsed = parseVtt(input.vtt);
   const normalizedRules = input.rules.map(normalizeRule);
@@ -772,6 +775,19 @@ export function buildPreview(input: {
   /* ---------- 导出残留防线：按最终状态生成候选文本并二次扫描 ---------- */
   const safety = runSafetyScan(cues, compiled);
 
+  /* ---------- 抽样复核：从最终应用命中确定性分层抽样 ---------- */
+  const allHits: Hit[] = [];
+  const seenHitKeys = new Set<string>();
+  for (const cue of cues) {
+    for (const h of cue.hits) {
+      // 跨 cue 命中挂在所有涉及 cue 上，按命中键去重后作为抽样候选
+      if (seenHitKeys.has(h.key)) continue;
+      seenHitKeys.add(h.key);
+      allHits.push(h);
+    }
+  }
+  const sampling = planSampling(allHits, normalizedRules, input.sampling);
+
   return {
     cueCount: parsed.cues.length,
     totalHits,
@@ -785,6 +801,7 @@ export function buildPreview(input: {
     entities: Array.from(entityMap.values()),
     safety,
     contextFilters,
+    sampling,
   };
 }
 
@@ -1073,11 +1090,14 @@ export function exportResult(input: {
   hitExceptions?: HitException[];
   entityDecisions?: EntityDecision[];
   aliases?: AliasEntry[];
+  sampling?: SamplingState;
   jobId?: string;
 }): ExportResult {
   const preview = buildPreview(input);
   // 导出残留防线：替换产物 / 跨边界新命中阻断导出（人工保留仅提示）
   if (preview.safety.blocked) throw new SafetyScanBlockedError(preview.safety);
+  // 抽样复核：存在未复核样本时阻断导出
+  if (preview.sampling.blocked) throw new SamplingPendingError(preview.sampling);
   const parsed = parseVtt(input.vtt);
   const payloadByIndex = new Map<number, string>();
   for (const cue of preview.cues) {
@@ -1124,9 +1144,13 @@ export function exportResult(input: {
   }
 
   const sha256 = createHash('sha256').update(input.vtt, 'utf8').digest('hex');
+  const hitByKey = new Map<string, Hit>();
+  for (const cue of preview.cues) {
+    for (const h of cue.hits) if (!hitByKey.has(h.key)) hitByKey.set(h.key, h);
+  }
   const audit: AuditReport = {
     app: 'subtitle-mask-console',
-    version: 6,
+    version: 7,
     generatedAt: new Date().toISOString(),
     source: {
       sha256,
@@ -1158,6 +1182,31 @@ export function exportResult(input: {
         crossBoundary: preview.safety.crossBoundary,
       },
       issues: preview.safety.issues,
+    },
+    sampling: {
+      enabled: preview.sampling.enabled,
+      config: preview.sampling.config,
+      candidates: preview.sampling.candidates,
+      quotas: preview.sampling.quotas,
+      counts: {
+        samples: preview.sampling.samples.length,
+        approved: preview.sampling.approved,
+        rejected: preview.sampling.rejected,
+        pending: preview.sampling.pending,
+      },
+      // 导出时仍有效的复核结论（驳回的命中已通过逐条例外保留原文）
+      conclusions: preview.sampling.reviews.map((r) => {
+        const h = hitByKey.get(r.key);
+        return {
+          key: r.key,
+          state: r.state,
+          reviewedAt: r.reviewedAt,
+          ruleId: h?.ruleId ?? '',
+          ruleName: h?.ruleName ?? '',
+          cueIndex: h?.spans[0]?.cueIndex ?? -1,
+          match: h?.match ?? '',
+        };
+      }),
     },
   };
 

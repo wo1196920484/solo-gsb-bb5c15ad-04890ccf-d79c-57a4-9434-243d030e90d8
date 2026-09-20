@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from 'react';
-import type { CueHit, Hit, HitSpan, PreviewResult } from '../types';
+import type { CueHit, Hit, HitSpan, PreviewResult, SamplingConfig, SamplingState } from '../types';
 import { SafetyPanel } from './SafetyPanel';
+import { SamplingPanel } from './SamplingPanel';
 
 interface Props {
   preview: PreviewResult | null;
@@ -9,6 +10,11 @@ interface Props {
   onClearException: (key: string) => void;
   onRevertAll: () => void;
   onApplyAll: () => void;
+  /** 抽样复核：持久化配置与结论 */
+  sampling: SamplingState;
+  onSamplingConfig: (patch: Partial<SamplingConfig>) => void;
+  onReviewSample: (key: string, state: 'approved' | 'rejected') => void;
+  onUnreviewSample: (key: string) => void;
 }
 
 /** 命中在本 cue 内的覆盖区间（跨 cue 命中按 spans 定位本 cue 部分） */
@@ -174,6 +180,10 @@ export function Preview({
   onClearException,
   onRevertAll,
   onApplyAll,
+  sampling,
+  onSamplingConfig,
+  onReviewSample,
+  onUnreviewSample,
 }: Props) {
   const [onlyMatched, setOnlyMatched] = useState(false);
   /** 残留防线「定位」闪烁的 cue 序号 */
@@ -274,6 +284,16 @@ export function Preview({
           ) : (
             <span className="stat-safety-ok">残留检查通过</span>
           )}
+          {preview.sampling.enabled &&
+            (preview.sampling.blocked ? (
+              <span className="stat-sampling-pending">
+                抽样待复核 {preview.sampling.pending}
+              </span>
+            ) : (
+              <span className="stat-sampling-done" title="抽样复核：样本已全部复核">
+                抽样复核通过
+              </span>
+            ))}
         </div>
       )}
 
@@ -289,6 +309,17 @@ export function Preview({
             </span>
           ))}
         </div>
+      )}
+
+      {preview && (
+        <SamplingPanel
+          plan={preview.sampling}
+          state={sampling}
+          onConfig={onSamplingConfig}
+          onReview={onReviewSample}
+          onUnreview={onUnreviewSample}
+          onLocate={locateCue}
+        />
       )}
 
       {preview && <SafetyPanel safety={preview.safety} onLocate={locateCue} />}

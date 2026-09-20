@@ -9,8 +9,17 @@ import type {
   MaskRule,
   Preset,
   PreviewResult,
+  SamplingConfig,
+  SamplingState,
 } from './types';
-import { uid, normalizeRule, inheritedState, withExceptionTarget } from './utils';
+import {
+  uid,
+  normalizeRule,
+  inheritedState,
+  withExceptionTarget,
+  DEFAULT_SAMPLING_STATE,
+  sameReviews,
+} from './utils';
 import { SAMPLE_VTT } from './sample';
 import { VttInput } from './components/VttInput';
 import { RulesPanel } from './components/RulesPanel';
@@ -29,6 +38,8 @@ export default function App() {
   /** 实体级决定（规则 + NFKC 实体键 → 始终应用 / 始终保留） */
   const [entityDecisions, setEntityDecisions] = useState<EntityDecision[]>([]);
   const [aliases, setAliases] = useState<AliasEntry[]>([]);
+  /** 抽样复核：配置与复核结论（随任务持久化） */
+  const [sampling, setSampling] = useState<SamplingState>(DEFAULT_SAMPLING_STATE);
   const [presets, setPresets] = useState<Preset[]>([]);
   const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [exportData, setExportData] = useState<ExportResult | null>(null);
@@ -61,6 +72,7 @@ export default function App() {
           setHitExceptions(job.hitExceptions ?? []);
           setEntityDecisions(job.entityDecisions ?? []);
           setAliases(job.aliases ?? []);
+          setSampling(job.sampling ?? DEFAULT_SAMPLING_STATE);
           setUpdatedAt(job.updatedAt);
         } else {
           // 首次使用：加载预设（全部预置，按 enabled 字段决定启用）
@@ -89,7 +101,7 @@ export default function App() {
     const reqId = ++previewReq.current;
     previewTimer.current = setTimeout(async () => {
       try {
-        const p = await api.preview({ vtt, rules, hitExceptions, entityDecisions, aliases });
+        const p = await api.preview({ vtt, rules, hitExceptions, entityDecisions, aliases, sampling });
         // 过期响应（用户已继续编辑 / 改名）直接丢弃
         if (reqId !== previewReq.current) return;
         setPreview(p);
@@ -108,7 +120,7 @@ export default function App() {
     return () => {
       if (previewTimer.current) clearTimeout(previewTimer.current);
     };
-  }, [vtt, rules, hitExceptions, entityDecisions, aliases, hydrated]);
+  }, [vtt, rules, hitExceptions, entityDecisions, aliases, sampling, hydrated]);
 
   /* ------------- 防抖自动保存（800ms），刷新可恢复 ------------- */
   useEffect(() => {
@@ -117,7 +129,7 @@ export default function App() {
     setSaveState('saving');
     saveTimer.current = setTimeout(async () => {
       try {
-        const { job } = await api.saveJob({ vtt, rules, hitExceptions, entityDecisions, aliases });
+        const { job } = await api.saveJob({ vtt, rules, hitExceptions, entityDecisions, aliases, sampling });
         setUpdatedAt(job.updatedAt);
         setSaveState('saved');
       } catch {
@@ -127,7 +139,7 @@ export default function App() {
     return () => {
       if (saveTimer.current) clearTimeout(saveTimer.current);
     };
-  }, [vtt, rules, hitExceptions, entityDecisions, aliases, hydrated]);
+  }, [vtt, rules, hitExceptions, entityDecisions, aliases, sampling, hydrated]);
 
   /* ------------- 逐条例外（显式覆盖实体决定） ------------- */
   const toggleHit = useCallback(
@@ -209,6 +221,45 @@ export default function App() {
     });
   }, [preview]);
 
+  /* ------------- 抽样复核：配置 / 逐项通过 / 驳回 ------------- */
+
+  /* 命中变化后：仅保留仍有效的复核结论（通过 → 命中仍为应用态；驳回 → 命中仍保留原文），
+     样本由服务端确定性补抽。内容不变时保持原引用，避免触发预览循环。 */
+  useEffect(() => {
+    if (!preview) return;
+    const valid = preview.sampling.reviews;
+    setSampling((prev) =>
+      sameReviews(prev.reviews, valid) ? prev : { ...prev, reviews: valid },
+    );
+  }, [preview]);
+
+  const updateSamplingConfig = useCallback((patch: Partial<SamplingConfig>) => {
+    setSampling((prev) => ({ ...prev, config: { ...prev.config, ...patch } }));
+  }, []);
+
+  /** 逐项复核：通过保持替换；驳回同步写入逐条例外（保留原文），命中退出候选集后服务端补抽 */
+  const reviewSample = useCallback((key: string, conclusion: 'approved' | 'rejected') => {
+    setSampling((prev) => ({
+      ...prev,
+      reviews: [
+        ...prev.reviews.filter((r) => r.key !== key),
+        { key, state: conclusion, reviewedAt: new Date().toISOString() },
+      ],
+    }));
+    if (conclusion === 'rejected') {
+      setHitExceptions((prev) => {
+        const map = new Map(prev.map((e) => [e.key, e.state] as const));
+        map.set(key, 'reverted');
+        return Array.from(map, ([k, state]) => ({ key: k, state }));
+      });
+    }
+  }, []);
+
+  /** 撤销「通过」：样本回到待复核（驳回的撤销走预览「↩ 应用」清除例外） */
+  const unreviewSample = useCallback((key: string) => {
+    setSampling((prev) => ({ ...prev, reviews: prev.reviews.filter((r) => r.key !== key) }));
+  }, []);
+
   /* ------------- 化名表手动改名 / 恢复自动 ------------- */
   const renameAlias = useCallback((ruleId: string, entityKey: string, alias: string) => {
     setAliases((list) =>
@@ -233,16 +284,18 @@ export default function App() {
   const doExport = async () => {
     if (!vtt.trim()) return;
     try {
-      const result = await api.export({ vtt, rules, hitExceptions, entityDecisions, aliases });
+      const result = await api.export({ vtt, rules, hitExceptions, entityDecisions, aliases, sampling });
       setExportData(result);
     } catch (e) {
-      // 残留防线 409：预览会随即重算并展示问题清单，这里给出横幅提示
+      // 残留防线 / 抽样复核 409：预览会随即重算并展示问题清单，这里给出横幅提示
       setError(`导出失败：${(e as Error).message}`);
     }
   };
 
   /** 导出残留防线：候选文本存在替换产物 / 跨边界新命中时阻断导出 */
   const safetyBlocked = preview?.safety.blocked ?? false;
+  /** 抽样复核：存在未复核样本时阻断导出 */
+  const samplingBlocked = preview?.sampling.blocked ?? false;
 
   const saveLabel = {
     idle: '',
@@ -267,15 +320,22 @@ export default function App() {
               ⛔ 残留检查未通过
             </span>
           )}
+          {samplingBlocked && (
+            <span className="safety-blocked-tag" title="抽样复核面板仍有未复核样本，逐项通过或驳回后才能导出">
+              ⛔ 抽样复核未完成
+            </span>
+          )}
           <span className={`save-state save-${saveState}`}>{saveLabel}</span>
           <button
             className="btn btn-primary btn-lg"
             onClick={doExport}
-            disabled={!vtt.trim() || safetyBlocked}
+            disabled={!vtt.trim() || safetyBlocked || samplingBlocked}
             title={
               safetyBlocked
                 ? '导出残留防线：存在替换产物 / 跨边界新命中，请先在预览区处理'
-                : undefined
+                : samplingBlocked
+                  ? '抽样复核未完成：请在预览区抽样复核面板逐项通过或驳回样本'
+                  : undefined
             }
           >
             ④ 确认并导出
@@ -320,6 +380,10 @@ export default function App() {
             onClearException={clearException}
             onRevertAll={revertAll}
             onApplyAll={applyAll}
+            sampling={sampling}
+            onSamplingConfig={updateSamplingConfig}
+            onReviewSample={reviewSample}
+            onUnreviewSample={unreviewSample}
           />
         </div>
       </main>
