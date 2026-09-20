@@ -6,7 +6,9 @@ import {
   exportResult,
   normalizeRule,
   SafetyScanBlockedError,
+  SampleReviewPendingError,
 } from './engine';
+import { defaultSampleConfig, normalizeSampleConfig } from './sampling';
 import { PRESETS } from './presets';
 import { JobStore } from './store';
 import type {
@@ -16,6 +18,7 @@ import type {
   JobState,
   MaskRule,
   PreviewInput,
+  SampleReview,
 } from './types';
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -173,6 +176,29 @@ function validateDecisions(decisions: unknown): EntityDecision[] | string {
   return out;
 }
 
+/** 校验并净化抽样复核记录；非法时返回错误文案（同键只保留第一条） */
+function validateSampleReviews(reviews: unknown): SampleReview[] | string {
+  if (reviews === undefined || reviews === null) return [];
+  if (!Array.isArray(reviews)) return 'sampleReviews 必须是数组';
+  const out: SampleReview[] = [];
+  const seen = new Set<string>();
+  for (const r of reviews) {
+    if (r === null || typeof r !== 'object') return '存在非法复核记录';
+    const x = r as Record<string, unknown>;
+    if (typeof x.key !== 'string' || !x.key) return '复核记录缺少 key';
+    if (x.verdict !== 'approve' && x.verdict !== 'reject')
+      return `复核记录 ${x.key} 结论非法`;
+    if (seen.has(x.key)) continue;
+    seen.add(x.key);
+    out.push({
+      key: x.key,
+      verdict: x.verdict,
+      reviewedAt: typeof x.reviewedAt === 'string' ? x.reviewedAt : '',
+    });
+  }
+  return out;
+}
+
 /** 旧版 revertedKeys → state=reverted 的逐条例外（显式例外优先，不覆盖已有条目） */
 function legacyRevertedAsExceptions(
   revertedKeys: unknown,
@@ -191,8 +217,16 @@ function legacyRevertedAsExceptions(
 }
 
 function readPreviewBody(req: Request): PreviewInput {
-  const { vtt, rules, revertedKeys, hitExceptions, entityDecisions, aliases } =
-    req.body as Partial<PreviewInput>;
+  const {
+    vtt,
+    rules,
+    revertedKeys,
+    hitExceptions,
+    entityDecisions,
+    aliases,
+    sampleConfig,
+    sampleReviews,
+  } = req.body as Partial<PreviewInput>;
   if (typeof vtt !== 'string') {
     throw new Error('vtt 必须是字符串');
   }
@@ -204,6 +238,8 @@ function readPreviewBody(req: Request): PreviewInput {
   if (typeof checkedExceptions === 'string') throw new Error(checkedExceptions);
   const checkedDecisions = validateDecisions(entityDecisions);
   if (typeof checkedDecisions === 'string') throw new Error(checkedDecisions);
+  const checkedReviews = validateSampleReviews(sampleReviews);
+  if (typeof checkedReviews === 'string') throw new Error(checkedReviews);
   return {
     vtt,
     rules: checked,
@@ -213,6 +249,8 @@ function readPreviewBody(req: Request): PreviewInput {
     hitExceptions: checkedExceptions,
     entityDecisions: checkedDecisions,
     aliases: checkedAliases,
+    sampleConfig: normalizeSampleConfig(sampleConfig ?? defaultSampleConfig()),
+    sampleReviews: checkedReviews,
   };
 }
 
@@ -233,8 +271,16 @@ app.get('/api/job', (_req, res) => {
 
 /** 自动保存编辑中的任务 */
 app.put('/api/job', (req, res) => {
-  const { vtt, rules, revertedKeys, hitExceptions, entityDecisions, aliases } =
-    req.body as Partial<JobState> & { revertedKeys?: unknown };
+  const {
+    vtt,
+    rules,
+    revertedKeys,
+    hitExceptions,
+    entityDecisions,
+    aliases,
+    sampleConfig,
+    sampleReviews,
+  } = req.body as Partial<JobState> & { revertedKeys?: unknown };
   if (typeof vtt !== 'string') return res.status(400).json({ error: 'vtt 必须是字符串' });
   const checked = validateRules(rules);
   if (typeof checked === 'string') return res.status(400).json({ error: checked });
@@ -252,6 +298,9 @@ app.put('/api/job', (req, res) => {
   const checkedAliases = validateAliases(aliases);
   if (typeof checkedAliases === 'string')
     return res.status(400).json({ error: checkedAliases });
+  const checkedReviews = validateSampleReviews(sampleReviews);
+  if (typeof checkedReviews === 'string')
+    return res.status(400).json({ error: checkedReviews });
 
   const previous = store.get();
   const state: JobState = {
@@ -261,6 +310,8 @@ app.put('/api/job', (req, res) => {
     hitExceptions: exceptions,
     entityDecisions: checkedDecisions,
     aliases: checkedAliases,
+    sampleConfig: normalizeSampleConfig(sampleConfig ?? defaultSampleConfig()),
+    sampleReviews: checkedReviews,
     updatedAt: new Date().toISOString(),
   };
   store.save(state);
@@ -277,7 +328,7 @@ app.post('/api/preview', (req, res) => {
   }
 });
 
-/** 确认导出：新 VTT + JSON 审计报告（残留防线阻断时返回 409 与问题清单） */
+/** 确认导出：新 VTT + JSON 审计报告（残留防线 / 抽样复核阻断时返回 409） */
 app.post('/api/export', (req, res) => {
   try {
     const input = readPreviewBody(req);
@@ -289,6 +340,10 @@ app.post('/api/export', (req, res) => {
   } catch (e) {
     if (e instanceof SafetyScanBlockedError) {
       res.status(409).json({ error: e.message, safetyScan: e.scan });
+      return;
+    }
+    if (e instanceof SampleReviewPendingError) {
+      res.status(409).json({ error: e.message, sample: e.sample });
       return;
     }
     res.status(400).json({ error: (e as Error).message });

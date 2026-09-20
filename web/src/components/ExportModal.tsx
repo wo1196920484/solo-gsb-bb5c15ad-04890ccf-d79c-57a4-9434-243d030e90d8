@@ -51,6 +51,14 @@ export function ExportModal({ vtt, audit, onClose }: Props) {
             ? `（${audit.safetyScan.counts.kept} 处人工保留命中，仅提示并已记入审计）`
             : '（候选文本无残留命中）'}
         </div>
+        {audit.sampleReview && (
+          <div className="export-sample" title="抽样配置、分层名额与逐项结论已写入审计 JSON 的 sampleReview 字段">
+            ✓ 抽样复核已完成：样本 {audit.sampleReview.sampled}
+            {audit.sampleReview.shortfall > 0 ? `（缺口 ${audit.sampleReview.shortfall}）` : ''}
+            {' '}· 通过 {audit.sampleReview.approved} · 驳回 {audit.sampleReview.rejected}
+            （配置：总数 {audit.sampleReview.config.total}；已记入审计 <code>sampleReview</code>）
+          </div>
+        )}
         <div className="modal-actions">
           <button
             className="btn"

@@ -256,6 +256,89 @@ export interface ContextFilterStat {
   afterFiltered: number;
 }
 
+/* ------------------------------------------------------------------ */
+/* 抽样复核                                                             */
+/* ------------------------------------------------------------------ */
+
+/** 抽样复核配置（随任务持久化） */
+export interface SampleConfig {
+  /** 是否启用抽样复核；关闭后不抽样、不阻断导出，配置与已复核记录仍保留 */
+  enabled: boolean;
+  /** 总抽样数（各规则最低样本数之外按命中占比分配；实际数量受总命中数限制） */
+  total: number;
+  /** 每条启用规则的最低样本数：ruleId → 数量；未配置的规则按 0 */
+  perRuleMinimum: Record<string, number>;
+}
+
+/** 抽样复核结论：approve 通过（应用替换）；reject 驳回（写入逐条撤销例外） */
+export type SampleVerdict = 'approve' | 'reject';
+
+/** 单条样本的复核记录（按命中键持久化，命中消失后记录失效并被清除） */
+export interface SampleReview {
+  /** 对应命中的稳定键 */
+  key: string;
+  verdict: SampleVerdict;
+  /** 复核时间（ISO 字符串） */
+  reviewedAt: string;
+}
+
+/** 单条规则分层的抽样配额与复核进度 */
+export interface SampleStratum {
+  ruleId: string;
+  ruleName: string;
+  /** 该规则当前最终应用命中总数（驳回 / 撤销后从候选池移出） */
+  poolHits: number;
+  /** 该规则最低样本数配置 */
+  minimum: number;
+  /** 最大余数法分配的目标名额（受候选池大小限制；已复核项保留时实际样本可超过该值） */
+  quota: number;
+  /** 当前样本数（仍有效的已复核项 + 新补抽项） */
+  sampled: number;
+  approved: number;
+  rejected: number;
+  /** 尚未复核的样本数 */
+  pending: number;
+}
+
+/** 复核面板中的一条样本（携带命中快照供逐项展示与操作） */
+export interface SampleItem {
+  key: string;
+  ruleId: string;
+  ruleName: string;
+  cueIndex: number;
+  cueId: string;
+  time: { start: string; end: string };
+  /** 涉及的全部 cue 序号（跨 cue 命中多于一个） */
+  cueIndexes: number[];
+  match: string;
+  replacement: string;
+  /** 当前最终状态（驳回写入例外后命中变为保留原文） */
+  reverted: boolean;
+  /** null = 尚未复核；approve 通过；reject 驳回 */
+  verdict: SampleVerdict | null;
+  reviewedAt?: string;
+}
+
+/** 抽样结果：分层配额、样本清单与整体进度（关闭抽样时各数组为空） */
+export interface SampleResult {
+  enabled: boolean;
+  total: number;
+  /** 全部最终应用命中数（跨 cue 命中按一次计） */
+  totalPoolHits: number;
+  /** 当前样本总数（仍有效的已复核项 + 补抽项） */
+  sampled: number;
+  approved: number;
+  rejected: number;
+  /** 尚未复核的样本数；> 0 时阻断导出 */
+  pending: number;
+  /** 是否所有分层都已达到可达到的名额（候选池不足会产生缺口） */
+  filled: boolean;
+  /** 因候选池不足而未能抽满的样本数 */
+  shortfall: number;
+  strata: SampleStratum[];
+  items: SampleItem[];
+}
+
 export interface PreviewResult {
   cueCount: number;
   totalHits: number;
@@ -274,6 +357,8 @@ export interface PreviewResult {
   safety: SafetyScanSummary;
   /** 上下文条件过滤计数（仅列实际发生过滤的规则，按规则顺序） */
   contextFilters: ContextFilterStat[];
+  /** 抽样复核：分层配额、样本清单与复核进度（关闭抽样时各数组为空） */
+  sample: SampleResult;
 }
 
 export interface PreviewInput {
@@ -286,6 +371,10 @@ export interface PreviewInput {
   /** 实体级决定（持久化，新命中自动继承） */
   entityDecisions?: EntityDecision[];
   aliases?: AliasEntry[];
+  /** 抽样复核配置 */
+  sampleConfig?: SampleConfig;
+  /** 抽样复核记录（按命中键持久化） */
+  sampleReviews?: SampleReview[];
 }
 
 export interface AuditRecord {
@@ -313,6 +402,18 @@ export interface AuditRecord {
   decisionSource?: DecisionSource;
 }
 
+/** 审计报告中的抽样复核结论（配置快照 + 分层配额 + 逐项结论） */
+export interface AuditSampleReview {
+  config: SampleConfig;
+  totalPoolHits: number;
+  sampled: number;
+  approved: number;
+  rejected: number;
+  shortfall: number;
+  strata: SampleStratum[];
+  items: SampleItem[];
+}
+
 export interface AuditReport {
   app: string;
   version: number;
@@ -333,6 +434,8 @@ export interface AuditReport {
   };
   /** 第一遍扫描中因上下文条件被过滤的候选命中计数（标明未通过的是哪一侧） */
   contextFilters: ContextFilterStat[];
+  /** 抽样复核：导出时的配置、分层配额与逐项结论（启用时存在） */
+  sampleReview?: AuditSampleReview;
   records: AuditRecord[];
   /** 稳定化名表（实体键、最终化名、编号、是否自动生成） */
   aliases?: AliasEntry[];
@@ -356,6 +459,10 @@ export interface JobState {
   entityDecisions: EntityDecision[];
   /** 稳定化名映射（持久化，编号不复用） */
   aliases: AliasEntry[];
+  /** 抽样复核配置（总抽样数 + 每条启用规则最低样本数） */
+  sampleConfig: SampleConfig;
+  /** 抽样复核记录（逐项通过 / 驳回，按命中键持久化） */
+  sampleReviews: SampleReview[];
   updatedAt: string;
 }
 

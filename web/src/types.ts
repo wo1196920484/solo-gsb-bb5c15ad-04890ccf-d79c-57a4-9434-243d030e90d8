@@ -185,6 +185,73 @@ export interface ContextFilterStat {
   afterFiltered: number;
 }
 
+/* ---------------- 抽样复核 ---------------- */
+
+/** 抽样复核配置（随任务持久化） */
+export interface SampleConfig {
+  enabled: boolean;
+  /** 总抽样数 */
+  total: number;
+  /** 每条启用规则的最低样本数：ruleId → 数量 */
+  perRuleMinimum: Record<string, number>;
+}
+
+/** 抽样复核结论：approve 通过；reject 驳回（写入逐条撤销例外） */
+export type SampleVerdict = 'approve' | 'reject';
+
+/** 单条样本的复核记录（按命中键持久化） */
+export interface SampleReview {
+  key: string;
+  verdict: SampleVerdict;
+  reviewedAt: string;
+}
+
+/** 单条规则分层的抽样配额与复核进度 */
+export interface SampleStratum {
+  ruleId: string;
+  ruleName: string;
+  /** 该规则当前最终应用命中总数 */
+  poolHits: number;
+  minimum: number;
+  quota: number;
+  sampled: number;
+  approved: number;
+  rejected: number;
+  pending: number;
+}
+
+/** 复核面板中的一条样本 */
+export interface SampleItem {
+  key: string;
+  ruleId: string;
+  ruleName: string;
+  cueIndex: number;
+  cueId: string;
+  time: { start: string; end: string };
+  cueIndexes: number[];
+  match: string;
+  replacement: string;
+  reverted: boolean;
+  verdict: SampleVerdict | null;
+  reviewedAt?: string;
+}
+
+/** 抽样结果：分层配额、样本清单与整体进度 */
+export interface SampleResult {
+  enabled: boolean;
+  total: number;
+  totalPoolHits: number;
+  sampled: number;
+  approved: number;
+  rejected: number;
+  /** 尚未复核的样本数；> 0 时阻断导出 */
+  pending: number;
+  filled: boolean;
+  shortfall: number;
+  strata: SampleStratum[];
+  items: SampleItem[];
+}
+
 export interface PreviewResult {
   cueCount: number;
   totalHits: number;
@@ -202,6 +269,8 @@ export interface PreviewResult {
   safety: SafetyScanSummary;
   /** 上下文条件过滤计数（仅列实际发生过滤的规则，按规则顺序） */
   contextFilters: ContextFilterStat[];
+  /** 抽样复核：分层配额、样本清单与复核进度 */
+  sample: SampleResult;
 }
 
 export interface JobState {
@@ -213,6 +282,10 @@ export interface JobState {
   /** 实体级决定 */
   entityDecisions: EntityDecision[];
   aliases: AliasEntry[];
+  /** 抽样复核配置 */
+  sampleConfig: SampleConfig;
+  /** 抽样复核记录 */
+  sampleReviews: SampleReview[];
   updatedAt: string;
 }
 
@@ -250,6 +323,8 @@ export interface AuditReport {
   };
   /** 第一遍扫描中因上下文条件被过滤的候选命中计数（标明未通过的是哪一侧） */
   contextFilters: ContextFilterStat[];
+  /** 抽样复核：导出时的配置、分层配额与逐项结论（启用时存在） */
+  sampleReview?: AuditSampleReview;
   records: AuditRecord[];
   aliases?: AliasEntry[];
   entityDecisions?: EntityDecision[];
@@ -259,6 +334,18 @@ export interface AuditReport {
     counts: { kept: number; artifact: number; crossBoundary: number };
     issues: SafetyScanIssue[];
   };
+}
+
+/** 审计报告中的抽样复核结论 */
+export interface AuditSampleReview {
+  config: SampleConfig;
+  totalPoolHits: number;
+  sampled: number;
+  approved: number;
+  rejected: number;
+  shortfall: number;
+  strata: SampleStratum[];
+  items: SampleItem[];
 }
 
 export interface ExportResult {

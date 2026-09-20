@@ -1,14 +1,25 @@
 import { useMemo, useRef, useState } from 'react';
-import type { CueHit, Hit, HitSpan, PreviewResult } from '../types';
+import type {
+  CueHit,
+  Hit,
+  HitSpan,
+  PreviewResult,
+  SampleConfig,
+  SampleVerdict,
+} from '../types';
 import { SafetyPanel } from './SafetyPanel';
+import { SamplePanel } from './SamplePanel';
 
 interface Props {
   preview: PreviewResult | null;
   loading: boolean;
+  sampleConfig: SampleConfig;
   onToggleHit: (key: string) => void;
   onClearException: (key: string) => void;
   onRevertAll: () => void;
   onApplyAll: () => void;
+  onSampleVerdict: (key: string, verdict: SampleVerdict) => void;
+  onClearSampleVerdict: (key: string) => void;
 }
 
 /** 命中在本 cue 内的覆盖区间（跨 cue 命中按 spans 定位本 cue 部分） */
@@ -170,10 +181,13 @@ function CueCard({
 export function Preview({
   preview,
   loading,
+  sampleConfig,
   onToggleHit,
   onClearException,
   onRevertAll,
   onApplyAll,
+  onSampleVerdict,
+  onClearSampleVerdict,
 }: Props) {
   const [onlyMatched, setOnlyMatched] = useState(false);
   /** 残留防线「定位」闪烁的 cue 序号 */
@@ -207,7 +221,7 @@ export function Preview({
   return (
     <section className="panel panel-grow">
       <header className="panel-header">
-        <h2>③ 替换预览与逐条撤销</h2>
+        <h2>④ 替换预览、抽样复核与逐条撤销</h2>
         <div className="panel-actions">
           <label className="filter-check">
             <input
@@ -292,6 +306,20 @@ export function Preview({
       )}
 
       {preview && <SafetyPanel safety={preview.safety} onLocate={locateCue} />}
+
+      {preview && sampleConfig.enabled && preview.sample.totalPoolHits >= 0 && preview.sample.strata.length > 0 && (
+        <SamplePanel
+          sample={preview.sample}
+          onVerdict={onSampleVerdict}
+          onClear={onClearSampleVerdict}
+          onLocate={locateCue}
+        />
+      )}
+      {preview && sampleConfig.enabled && preview.sample.strata.length === 0 && (
+        <div className="sample-panel sample-empty">
+          抽样复核已启用，但当前没有任何最终应用命中可供抽样（全部命中均已撤销 / 保留时不阻断导出）。
+        </div>
+      )}
 
       <div className="cue-list">
         {preview && cues.length === 0 && <div className="empty-tip">没有可显示的字幕。</div>}

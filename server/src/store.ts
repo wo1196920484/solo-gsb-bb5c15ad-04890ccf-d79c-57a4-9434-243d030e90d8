@@ -1,12 +1,14 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { normalizeRule } from './engine';
-import type { HitException, JobState, MaskRule } from './types';
+import { defaultSampleConfig, normalizeSampleConfig } from './sampling';
+import type { HitException, JobState, MaskRule, SampleReview } from './types';
 
 /**
  * 兼容旧版本任务文件，规整为当前 JobState：
  * - 旧版 revertedKeys（逐条撤销 key 列表）迁移为 state=reverted 的逐条例外；
  * - 缺少的实体决定 / 例外 / 化名表字段补空数组；
+ * - 缺少抽样复核配置时补默认配置（关闭），复核记录补空数组并净化；
  * - 旧规则缺少上下文字段（beforePattern / afterPattern / beforeChars / afterChars）
  *   时按「无条件」迁移，缺少跨 cue / 化名字段同样补齐默认值。
  */
@@ -31,6 +33,14 @@ export function migrateJobState(
         .filter((r): r is MaskRule => !!r && typeof r === 'object')
         .map((r) => normalizeRule(r))
     : [];
+  const sampleReviews: SampleReview[] = Array.isArray(parsed.sampleReviews)
+    ? parsed.sampleReviews.filter(
+        (r): r is SampleReview =>
+          !!r &&
+          typeof r.key === 'string' &&
+          (r.verdict === 'approve' || r.verdict === 'reject'),
+      )
+    : [];
   return {
     jobId: typeof parsed.jobId === 'string' ? parsed.jobId : '',
     vtt: typeof parsed.vtt === 'string' ? parsed.vtt : '',
@@ -40,6 +50,11 @@ export function migrateJobState(
       ? parsed.entityDecisions
       : [],
     aliases: Array.isArray(parsed.aliases) ? parsed.aliases : [],
+    sampleConfig:
+      parsed.sampleConfig !== undefined
+        ? normalizeSampleConfig(parsed.sampleConfig)
+        : defaultSampleConfig(),
+    sampleReviews,
     updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : '',
   };
 }

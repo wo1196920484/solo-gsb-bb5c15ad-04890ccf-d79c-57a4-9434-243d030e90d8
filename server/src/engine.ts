@@ -1,5 +1,11 @@
 import { createHash } from 'crypto';
 import { parseVtt, serializeVtt } from './vtt';
+import {
+  computeSample,
+  defaultSampleConfig,
+  enrichSampleItems,
+  normalizeSampleConfig,
+} from './sampling';
 import type {
   AliasEntry,
   AuditRecord,
@@ -14,6 +20,9 @@ import type {
   HitException,
   MaskRule,
   PreviewResult,
+  SampleConfig,
+  SampleReview,
+  SampleResult,
   SafetyScanIssue,
   SafetyScanKind,
   SafetyScanSegment,
@@ -464,6 +473,8 @@ export function buildPreview(input: {
   hitExceptions?: HitException[];
   entityDecisions?: EntityDecision[];
   aliases?: AliasEntry[];
+  sampleConfig?: SampleConfig;
+  sampleReviews?: SampleReview[];
 }): PreviewResult {
   const parsed = parseVtt(input.vtt);
   const normalizedRules = input.rules.map(normalizeRule);
@@ -646,6 +657,8 @@ export function buildPreview(input: {
   let exceptionHits = 0;
   /** 实体决策列表：按首次命中顺序登记，最后叠加仅存在于决定中的实体 */
   const entityMap = new Map<string, EntitySummary>();
+  /** 胜出命中对象（跨 cue 命中仅一个对象，抽样按此去重） */
+  const winningHits: Hit[] = [];
 
   for (const h of kept) {
     let aliasName: string | undefined;
@@ -741,6 +754,7 @@ export function buildPreview(input: {
     };
     // 同一命中对象挂到所有涉及 cue：预览联动高亮，撤销 / 例外共用同一命中键
     for (const s of h.spans) cueByIndex.get(s.cueIndex)?.hits.push(hit);
+    winningHits.push(hit);
   }
 
   /* 每条 cue 内按本 cue 覆盖区间起点排序，保证渲染与应用顺序稳定 */
@@ -772,6 +786,33 @@ export function buildPreview(input: {
   /* ---------- 导出残留防线：按最终状态生成候选文本并二次扫描 ---------- */
   const safety = runSafetyScan(cues, compiled);
 
+  /* ---------- 抽样复核：从最终应用命中中确定性分层抽样 ---------- */
+  const sampleConfig = normalizeSampleConfig(input.sampleConfig ?? defaultSampleConfig());
+  // 净化复核记录：仅保留合法结论、同键取首条
+  const rawReviews = Array.isArray(input.sampleReviews) ? input.sampleReviews : [];
+  const sampleReviews: SampleReview[] = [];
+  const seenReviewKeys = new Set<string>();
+  for (const r of rawReviews) {
+    if (
+      r &&
+      typeof r.key === 'string' &&
+      r.key &&
+      (r.verdict === 'approve' || r.verdict === 'reject') &&
+      !seenReviewKeys.has(r.key)
+    ) {
+      seenReviewKeys.add(r.key);
+      sampleReviews.push({
+        key: r.key,
+        verdict: r.verdict,
+        reviewedAt: typeof r.reviewedAt === 'string' ? r.reviewedAt : '',
+      });
+    }
+  }
+  const sample = enrichSampleItems(
+    computeSample({ config: sampleConfig, rules: normalizedRules, hits: winningHits, reviews: sampleReviews }),
+    new Map(cues.map((c) => [c.index, { id: c.id, start: c.start, end: c.end }])),
+  );
+
   return {
     cueCount: parsed.cues.length,
     totalHits,
@@ -785,6 +826,7 @@ export function buildPreview(input: {
     entities: Array.from(entityMap.values()),
     safety,
     contextFilters,
+    sample,
   };
 }
 
@@ -1062,6 +1104,16 @@ export class SafetyScanBlockedError extends Error {
   }
 }
 
+/** 抽样复核拦截：启用抽样且仍有样本未逐项复核 */
+export class SampleReviewPendingError extends Error {
+  sample: SampleResult;
+  constructor(sample: SampleResult) {
+    super(`抽样复核未完成：还有 ${sample.pending} 条样本未复核，请逐条通过或驳回后再导出`);
+    this.name = 'SampleReviewPendingError';
+    this.sample = sample;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* 导出                                                                */
 /* ------------------------------------------------------------------ */
@@ -1073,11 +1125,17 @@ export function exportResult(input: {
   hitExceptions?: HitException[];
   entityDecisions?: EntityDecision[];
   aliases?: AliasEntry[];
+  sampleConfig?: SampleConfig;
+  sampleReviews?: SampleReview[];
   jobId?: string;
 }): ExportResult {
   const preview = buildPreview(input);
   // 导出残留防线：替换产物 / 跨边界新命中阻断导出（人工保留仅提示）
   if (preview.safety.blocked) throw new SafetyScanBlockedError(preview.safety);
+  // 抽样复核：启用时存在未复核样本阻断导出
+  if (preview.sample.enabled && preview.sample.pending > 0) {
+    throw new SampleReviewPendingError(preview.sample);
+  }
   const parsed = parseVtt(input.vtt);
   const payloadByIndex = new Map<number, string>();
   for (const cue of preview.cues) {
@@ -1126,7 +1184,7 @@ export function exportResult(input: {
   const sha256 = createHash('sha256').update(input.vtt, 'utf8').digest('hex');
   const audit: AuditReport = {
     app: 'subtitle-mask-console',
-    version: 6,
+    version: 7,
     generatedAt: new Date().toISOString(),
     source: {
       sha256,
@@ -1142,6 +1200,18 @@ export function exportResult(input: {
       exceptionHits: preview.exceptionHits,
     },
     contextFilters: preview.contextFilters,
+    sampleReview: preview.sample.enabled
+      ? {
+          config: normalizeSampleConfig(input.sampleConfig ?? defaultSampleConfig()),
+          totalPoolHits: preview.sample.totalPoolHits,
+          sampled: preview.sample.sampled,
+          approved: preview.sample.approved,
+          rejected: preview.sample.rejected,
+          shortfall: preview.sample.shortfall,
+          strata: preview.sample.strata,
+          items: preview.sample.items,
+        }
+      : undefined,
     records,
     aliases: preview.aliases,
     entityDecisions: (input.entityDecisions ?? []).map((d) => ({

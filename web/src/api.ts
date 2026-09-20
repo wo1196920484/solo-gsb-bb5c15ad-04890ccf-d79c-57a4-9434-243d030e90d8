@@ -8,6 +8,8 @@ import type {
   MaskRule,
   Preset,
   PreviewResult,
+  SampleConfig,
+  SampleReview,
 } from './types';
 
 /** 预览 / 保存 / 导出共用的任务载荷（三者必须使用同一份状态） */
@@ -17,6 +19,8 @@ export interface JobPayload {
   hitExceptions: HitException[];
   entityDecisions: EntityDecision[];
   aliases: AliasEntry[];
+  sampleConfig: SampleConfig;
+  sampleReviews: SampleReview[];
 }
 
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
